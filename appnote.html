@@ -1,0 +1,107 @@
+<h1 id="introduction">Introduction</h1>
+<p>This application note describes how applications can make use of program memory beyond 128 KB (64 kilowords), when compiled with the GCC toolchain. Applications can make use the memory for code or for data. Usage of the memory for code works in general, with a few caveats. Usage for data, however, requires some extra steps to be done by the user in the current version of the toolchain (GCC 4.7.2, Binutils 2.23.1).</p>
+<h1 id="code-beyond-128-kb">Code beyond 128 KB</h1>
+<p>Except for the special case described below, programs with code bigger than 128 KB work fine out of the box, provided</p>
+<ol style="list-style-type: decimal">
+<li>Linker relaxation is turned on by passing -mrelax to avr-gcc (or --relax to avr-ld).</li>
+<li>The EIND I/O register is not set by code i.e., EIND is zero.</li>
+</ol>
+<h2 id="what-does-not-work">What does not work</h2>
+<p>The following code somehow knows func lies at the constant address BEYOND_128, and casts that address to a pointer to a function and tries to call it. This code will not work if BEYOND_128 is a value above 128 KB.</p>
+<pre><code>void indirect_call_through_cast()
+{
+    ((void (*ptr)(void)) BEYOND_128)();
+}</code></pre>
+<p>To work around this, declare an extern function, call it from code, and then specify the address for the function when linking using the -Wl,--defsym option. To make the above code work, change it to</p>
+<pre><code>void indirect_call_through_cast()
+{
+    extern void beyond_128();
+    beyond_128();
+}</code></pre>
+<p>and then specify -Wl,--defsym,beyond_128=<byte_address_in_program_memory> when linking.</p>
+<h2 id="what-works">What works</h2>
+<p>Direct calling of functions and jumps to labels works normally. Calls through a function pointer work, as long as the pointer is not initialized with a cast from an arbitrary address, as done above.</p>
+<p>The following code works, regardless of where the function func gets placed.</p>
+<pre><code>void func(void){}
+
+void indirect_call(void)
+{
+    void (*ptr)(void) = &amp;func;
+    ptr();
+}</code></pre>
+<p>Normal gotos, as well as Computed gotos also work</p>
+<pre><code>void  computed_goto(char x)
+{
+   void **labels[] = { &amp;&amp;label_beyond_128_1, &amp;&amp;label_beyond_128_2 }; 
+   goto *labels[x];
+    
+label_beyond_128_1:
+    while (1);
+label_beyond_128_2:
+    return;
+}</code></pre>
+<h2 id="how-it-works">How it works</h2>
+<p>The AVR instruction set provides EICALL and EIJMP to perform indirect calls and jumps to addresses beyond 64 kilowords, with the EIND I/O register holding the extra MSBs. However, the AVR port for GCC fixes the size of a pointer to be 16 bits, which restricts the addressable range to 64 kilowords (128 KB) of program memory. This means that without special handling, addresses beyond 64 kilowords are inaccessible through a pointer.</p>
+<p>To work around the pointer size limitation and still support code bigger than 64 kilowords, the toolchain uses trampolines. When the toolchain detects an indirect call/jump, it generates a trampoline to jump to the actual target address, and makes the trampoline the target of the indirect call/jmp. The trampoline uses the JMP instruction and can therefore reach any address in program memory.</p>
+<p>This trampoline mechanism obviates the need for the EIND I/O register, and hence the toolchain never sets it and assumes that it never changes.</p>
+<p>For more information about implementation details and restrictions, please refer to the section &quot;EIND and Devices with more than 128 Ki Bytes of Flash&quot; at http://gcc.gnu.org/onlinedocs/gcc/AVR-Options.html</p>
+<h1 id="data-beyond-128-kb">Data beyond 128 KB</h1>
+<p>The GCC toolchain allows user code to read (constant) data from program memory, using either the macros and functions in <avr/pgmspace.h> provided by avr-libc, or the named address space feature newly introduced GCC 4.7.2. For avr-libc based code, the far variants of pgm_read_xxx macros provide access to program memory beyond 64 kilowords (128 KB). For example,</p>
+<pre><code>#include &lt;avr/pgmspace.h&gt;
+
+int main()
+{
+    /* Read a byte from byte address 0x20000 */
+    char val = pgm_read_byte_far(0x20000);
+    return val;
+}</code></pre>
+<p>The named address space feature newly introduced in GCC 4.7.2 lets user code access both program and data memory in a uniform way, without any explicit macro/function calls. The toolchain makes use of the address space qualifier attached to data / pointers in order to determine both the location in program memory, and the right set of instructions to emit for a read. The following example places a char array in flash and reads it using a char pointer.</p>
+<pre><code>const __flash char val[] = { 20, 30};
+
+char func(const __flash char *p)
+{
+    return *p;
+}
+
+int main()
+{
+   return func(val);
+}</code></pre>
+<p>The following address space qualifiers are available :-</p>
+<ol style="list-style-type: decimal">
+<li>__flash</li>
+</ol>
+<p>Places data in the lower 64 kilowords of program memory, and emits LPM to read.</p>
+<ol start="2" style="list-style-type: decimal">
+<li>__flash1</li>
+<li>__flash2</li>
+<li>__flash3</li>
+<li>__flash4</li>
+<li>__flash5</li>
+</ol>
+<p>Places data in section .progmem<N>.data , and emits ELPM to read, with RAMPZ set to <N></p>
+<ol start="7" style="list-style-type: decimal">
+<li>__memx</li>
+</ol>
+<p>Emits instructions to read from a 24 bit address space that contains data memory and all the above program memory address spaces. The MSB of the address is automatically set by the compiler for data memory access, and is used to distinguish between program and data memory reads.</p>
+<p>__flash<N> address spaces do not work out of the box - the linker script needs to be modified to specify the addresses at which the .progmem<N>.data sections should be placed in program memory. A simple (but ineffecient) approach would be create output sections for flash<N>, with each section starting at 0x<N>0000. This forces each address space to start from 0x<N>0000 though, whereas it only required that the address space fit somewhere between 0x<N>0000 and 0x<N>FFFF.</p>
+<pre><code>  .flash1 0x10000 :
+  { *(.progmem1.data*)    /* Page 1 */
+  } &gt; text
+
+  .flash2 0x20000 :
+  { *(.progmem2.data*)    /* Page 2 */
+  } &gt; text
+
+  .flash3 0x30000 :
+  { *(.progmem3.data*)    /* Page 3 */
+  } &gt; text
+
+  .flash4 0x40000 :
+  { *(.progmem4.data*)    /* Page 4 */
+  } &gt; text
+
+  .flash5 0x50000 :
+  { *(.progmem5.data*)    /* Page 5 */
+  } &gt; text</code></pre>
+<p>For more information, please refer to the section &quot;AVR Named Address Spaces&quot; at http://gcc.gnu.org/onlinedocs/gcc/Named-Address-Spaces.html</p>
